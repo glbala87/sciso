@@ -1,0 +1,533 @@
+"""Allele-specific expression analysis using long-read phasing.
+
+Detects allelic imbalance at heterozygous sites using single-cell
+long-read data. Supports variant discovery from BAM pileups or
+loading pre-called variants from VCF. Tests for allelic imbalance
+per cell and per cluster using binomial and Fisher's exact tests.
+"""
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import scipy.stats
+
+from ._logging import get_named_logger, wf_parser
+
+
+def argparser():
+    """Create argument parser."""
+    parser = wf_parser("allele_specific_expression")
+
+    parser.add_argument(
+        "tagged_bam", type=Path,
+        help="BAM file with cell barcode (CB) tags.")
+    parser.add_argument(
+        "--vcf", type=Path, default=None,
+        help="VCF file with heterozygous variant calls. "
+             "If not provided, variants are discovered from BAM pileups.")
+    parser.add_argument(
+        "--clusters", type=Path, required=True,
+        help="TSV with columns barcode, cluster.")
+    parser.add_argument(
+        "--output_ase", type=Path, default="ase_results.tsv",
+        help="Output TSV with per-variant allele-specific expression.")
+    parser.add_argument(
+        "--output_summary", type=Path, default="ase_summary.json",
+        help="Output JSON with ASE summary statistics.")
+    parser.add_argument(
+        "--min_total_counts", type=int, default=10,
+        help="Minimum total allelic counts per variant per cell/cluster.")
+    parser.add_argument(
+        "--min_cells", type=int, default=5,
+        help="Minimum cells covering a variant site.")
+    parser.add_argument(
+        "--fdr_threshold", type=float, default=0.05,
+        help="FDR threshold for significant allelic imbalance.")
+    parser.add_argument(
+        "--min_base_quality", type=int, default=20,
+        help="Minimum base quality for allele counting.")
+
+    return parser
+
+
+def extract_variants_from_bam(bam_path, min_bq=20, min_cov=10):
+    """Discover heterozygous positions from BAM pileups.
+
+    Scans pileup columns and identifies positions where two alleles
+    each comprise at least 20% of reads. This heuristic captures
+    likely heterozygous SNVs without requiring a VCF.
+
+    :param bam_path: Path to indexed BAM file.
+    :param min_bq: minimum base quality to count an allele.
+    :param min_cov: minimum coverage to evaluate a position.
+    :returns: DataFrame with columns chrom, pos, ref, alt.
+    """
+    import pysam
+
+    logger = get_named_logger("Variants")
+    logger.info(f"Discovering heterozygous variants from {bam_path}.")
+
+    variants = []
+    bam = pysam.AlignmentFile(str(bam_path), 'rb')
+
+    for pileup_col in bam.pileup(
+            min_base_quality=min_bq,
+            truncate=True,
+            stepper='samtools'):
+
+        chrom = pileup_col.reference_name
+        pos = pileup_col.reference_pos
+
+        allele_counts = {}
+        for read in pileup_col.pileups:
+            if read.is_del or read.is_refskip:
+                continue
+            base = read.alignment.query_sequence[read.query_position]
+            base = base.upper()
+            if base not in 'ACGT':
+                continue
+            allele_counts[base] = allele_counts.get(base, 0) + 1
+
+        total = sum(allele_counts.values())
+        if total < min_cov:
+            continue
+
+        # Identify two most common alleles
+        sorted_alleles = sorted(
+            allele_counts.items(), key=lambda x: -x[1])
+        if len(sorted_alleles) < 2:
+            continue
+
+        top_base, top_count = sorted_alleles[0]
+        sec_base, sec_count = sorted_alleles[1]
+
+        # Both alleles must be at least 20% frequency
+        if (top_count / total >= 0.20
+                and sec_count / total >= 0.20):
+            variants.append({
+                'chrom': chrom,
+                'pos': pos,
+                'ref': top_base,
+                'alt': sec_base,
+            })
+
+    bam.close()
+
+    variant_df = pd.DataFrame(variants)
+    logger.info(f"Discovered {len(variant_df)} heterozygous positions.")
+    return variant_df
+
+
+def load_variants_from_vcf(vcf_path):
+    """Parse VCF file for heterozygous variant sites.
+
+    Extracts positions where the genotype (GT) is heterozygous (0/1 or
+    0|1). Only single-nucleotide variants are retained.
+
+    :param vcf_path: Path to VCF file.
+    :returns: DataFrame with columns chrom, pos, ref, alt.
+    """
+    logger = get_named_logger("VCF")
+    logger.info(f"Loading variants from {vcf_path}.")
+
+    variants = []
+    path = Path(vcf_path)
+
+    if path.suffix == '.gz':
+        import gzip
+        opener = gzip.open(path, 'rt')
+    else:
+        opener = open(path, 'r')
+
+    with opener as fh:
+        for line in fh:
+            if line.startswith('#'):
+                continue
+            fields = line.strip().split('\t')
+            if len(fields) < 10:
+                continue
+
+            chrom = fields[0]
+            pos = int(fields[1]) - 1  # Convert to 0-based
+            ref = fields[3]
+            alt = fields[4]
+
+            # Only keep SNVs
+            if len(ref) != 1 or len(alt) != 1:
+                continue
+
+            # Check genotype for heterozygosity
+            format_fields = fields[8].split(':')
+            sample_fields = fields[9].split(':')
+            gt_idx = format_fields.index('GT') \
+                if 'GT' in format_fields else 0
+            gt = sample_fields[gt_idx]
+            if gt in ('0/1', '1/0', '0|1', '1|0'):
+                variants.append({
+                    'chrom': chrom,
+                    'pos': pos,
+                    'ref': ref,
+                    'alt': alt,
+                })
+
+    variant_df = pd.DataFrame(variants)
+    logger.info(f"Loaded {len(variant_df)} heterozygous SNVs from VCF.")
+    return variant_df
+
+
+def count_alleles_per_cell(bam_path, variants, min_bq=20):
+    """Count reference and alternative alleles per cell per variant.
+
+    For each variant site, iterates over covering reads. If a read
+    carries a CB (cell barcode) tag, its allele is counted for that
+    cell.
+
+    :param bam_path: Path to indexed BAM file.
+    :param variants: DataFrame with chrom, pos, ref, alt.
+    :param min_bq: minimum base quality for counting.
+    :returns: DataFrame with chrom, pos, barcode, ref_count, alt_count.
+    """
+    import pysam
+
+    logger = get_named_logger("AlleleCt")
+    logger.info(
+        f"Counting alleles per cell at {len(variants)} variant sites.")
+
+    bam = pysam.AlignmentFile(str(bam_path), 'rb')
+    records = []
+
+    for _, var in variants.iterrows():
+        chrom = var['chrom']
+        pos = int(var['pos'])
+        ref_base = var['ref'].upper()
+        alt_base = var['alt'].upper()
+
+        cell_alleles = {}  # barcode -> [ref_count, alt_count]
+
+        for read in bam.fetch(chrom, pos, pos + 1):
+            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+
+            # Get cell barcode
+            try:
+                barcode = read.get_tag('CB')
+            except KeyError:
+                continue
+
+            # Get base at variant position
+            pairs = read.get_aligned_pairs(with_seq=True)
+            for query_pos, ref_pos, ref_seq in pairs:
+                if ref_pos == pos and query_pos is not None:
+                    base_qual = read.query_qualities[query_pos]
+                    if base_qual < min_bq:
+                        break
+                    query_base = read.query_sequence[query_pos].upper()
+                    if barcode not in cell_alleles:
+                        cell_alleles[barcode] = [0, 0]
+                    if query_base == ref_base:
+                        cell_alleles[barcode][0] += 1
+                    elif query_base == alt_base:
+                        cell_alleles[barcode][1] += 1
+                    break
+
+        for barcode, (rc, ac) in cell_alleles.items():
+            if rc + ac > 0:
+                records.append({
+                    'chrom': chrom,
+                    'pos': pos,
+                    'barcode': barcode,
+                    'ref_count': rc,
+                    'alt_count': ac,
+                })
+
+    bam.close()
+
+    allele_df = pd.DataFrame(records)
+    logger.info(
+        f"Counted alleles in {len(allele_df)} cell-variant pairs "
+        f"across {allele_df['barcode'].nunique() if len(allele_df) > 0 else 0}"
+        f" cells.")
+    return allele_df
+
+
+def test_allelic_imbalance(ref_count, alt_count):
+    """Test for allelic imbalance at a single site using binomial test.
+
+    Tests the null hypothesis that both alleles are equally represented
+    (p = 0.5). Uses scipy.stats.binomtest.
+
+    :param ref_count: number of reference allele observations.
+    :param alt_count: number of alternative allele observations.
+    :returns: tuple (pvalue, allelic_ratio) where allelic_ratio = alt/(ref+alt).
+    """
+    total = ref_count + alt_count
+    if total == 0:
+        return 1.0, np.nan
+
+    k = min(ref_count, alt_count)
+    result = scipy.stats.binomtest(k, total, 0.5)
+    pvalue = result.pvalue
+    allelic_ratio = alt_count / total
+    return pvalue, allelic_ratio
+
+
+def aggregate_by_cluster(allele_counts, cluster_labels):
+    """Aggregate allele counts per cluster and test for imbalance.
+
+    For each variant in each cluster, sums allele counts across cells
+    and tests for allelic imbalance. Additionally performs Fisher's exact
+    test for differential ASE between all pairs of clusters.
+
+    :param allele_counts: DataFrame from count_alleles_per_cell.
+    :param cluster_labels: Series mapping barcode -> cluster.
+    :returns: tuple (cluster_ase_df, differential_ase_df).
+    """
+    logger = get_named_logger("ClusterASE")
+
+    if len(allele_counts) == 0:
+        empty = pd.DataFrame()
+        return empty, empty
+
+    # Map barcodes to clusters
+    allele_counts = allele_counts.copy()
+    allele_counts['cluster'] = allele_counts['barcode'].map(cluster_labels)
+    allele_counts = allele_counts.dropna(subset=['cluster'])
+
+    if len(allele_counts) == 0:
+        logger.warning("No allele counts mapped to clusters.")
+        empty = pd.DataFrame()
+        return empty, empty
+
+    # Aggregate per variant per cluster
+    grouped = allele_counts.groupby(['chrom', 'pos', 'cluster']).agg(
+        ref_count=('ref_count', 'sum'),
+        alt_count=('alt_count', 'sum'),
+        n_cells=('barcode', 'nunique'),
+    ).reset_index()
+
+    # Test imbalance per cluster
+    cluster_rows = []
+    for _, row in grouped.iterrows():
+        rc = int(row['ref_count'])
+        ac = int(row['alt_count'])
+        pval, ratio = test_allelic_imbalance(rc, ac)
+        cluster_rows.append({
+            'chrom': row['chrom'],
+            'pos': int(row['pos']),
+            'cluster': row['cluster'],
+            'ref_count': rc,
+            'alt_count': ac,
+            'total_count': rc + ac,
+            'n_cells': int(row['n_cells']),
+            'allelic_ratio': round(ratio, 4) if not np.isnan(ratio) else np.nan,
+            'pvalue': pval,
+        })
+
+    cluster_ase_df = pd.DataFrame(cluster_rows)
+
+    # BH correction
+    if len(cluster_ase_df) > 0:
+        cluster_ase_df['pvalue_adj'] = _bh_correct(
+            cluster_ase_df['pvalue'].values)
+
+    # Differential ASE between cluster pairs (Fisher's exact)
+    diff_rows = []
+    unique_clusters = sorted(cluster_ase_df['cluster'].unique())
+    variant_groups = cluster_ase_df.groupby(['chrom', 'pos'])
+
+    for (chrom, pos), vgrp in variant_groups:
+        cluster_data = {
+            row['cluster']: (int(row['ref_count']), int(row['alt_count']))
+            for _, row in vgrp.iterrows()
+        }
+        for i, c1 in enumerate(unique_clusters):
+            for c2 in unique_clusters[i + 1:]:
+                if c1 not in cluster_data or c2 not in cluster_data:
+                    continue
+                r1, a1 = cluster_data[c1]
+                r2, a2 = cluster_data[c2]
+                if r1 + a1 == 0 or r2 + a2 == 0:
+                    continue
+                _, fisher_p = scipy.stats.fisher_exact(
+                    [[r1, a1], [r2, a2]])
+                diff_rows.append({
+                    'chrom': chrom,
+                    'pos': int(pos),
+                    'cluster_1': c1,
+                    'cluster_2': c2,
+                    'ref_1': r1, 'alt_1': a1,
+                    'ref_2': r2, 'alt_2': a2,
+                    'ratio_1': round(a1 / (r1 + a1), 4),
+                    'ratio_2': round(a2 / (r2 + a2), 4),
+                    'fisher_pvalue': fisher_p,
+                })
+
+    diff_ase_df = pd.DataFrame(diff_rows)
+    if len(diff_ase_df) > 0:
+        diff_ase_df['fisher_pvalue_adj'] = _bh_correct(
+            diff_ase_df['fisher_pvalue'].values)
+
+    n_sig_cluster = 0
+    n_sig_diff = 0
+    if len(cluster_ase_df) > 0:
+        n_sig_cluster = int(
+            (cluster_ase_df['pvalue_adj'] <= 0.05).sum())
+    if len(diff_ase_df) > 0:
+        n_sig_diff = int(
+            (diff_ase_df['fisher_pvalue_adj'] <= 0.05).sum())
+
+    logger.info(
+        f"Cluster ASE: {n_sig_cluster} significant imbalanced "
+        f"variant-cluster pairs; {n_sig_diff} differential ASE pairs.")
+    return cluster_ase_df, diff_ase_df
+
+
+def _bh_correct(pvalues):
+    """Benjamini-Hochberg FDR correction."""
+    pvalues = np.asarray(pvalues, dtype=float)
+    n = len(pvalues)
+    if n == 0:
+        return pvalues
+
+    valid = ~np.isnan(pvalues)
+    adjusted = np.full_like(pvalues, np.nan)
+
+    if valid.sum() == 0:
+        return adjusted
+
+    valid_p = pvalues[valid]
+    sort_idx = np.argsort(valid_p)
+    sorted_p = valid_p[sort_idx]
+    ranks = np.arange(1, len(sorted_p) + 1)
+    adj_sorted = sorted_p * len(sorted_p) / ranks
+
+    # Enforce monotonicity
+    for i in range(len(adj_sorted) - 2, -1, -1):
+        adj_sorted[i] = min(adj_sorted[i], adj_sorted[i + 1])
+    adj_sorted = np.minimum(adj_sorted, 1.0)
+
+    unsort_idx = np.argsort(sort_idx)
+    adjusted[valid] = adj_sorted[unsort_idx]
+    return adjusted
+
+
+def main(args):
+    """Run allele-specific expression analysis pipeline."""
+    logger = get_named_logger("ASE")
+    logger.info("Starting allele-specific expression analysis.")
+
+    # Discover or load variants
+    if args.vcf is not None:
+        variants = load_variants_from_vcf(args.vcf)
+    else:
+        variants = extract_variants_from_bam(
+            args.tagged_bam,
+            min_bq=args.min_base_quality,
+            min_cov=args.min_total_counts)
+
+    if len(variants) == 0:
+        logger.warning("No heterozygous variants found. Exiting.")
+        # Write empty outputs
+        pd.DataFrame(columns=[
+            'chrom', 'pos', 'cluster', 'ref_count', 'alt_count',
+            'pvalue', 'pvalue_adj'
+        ]).to_csv(args.output_ase, sep='\t', index=False)
+        with open(args.output_summary, 'w') as fh:
+            json.dump({'n_variants': 0, 'n_significant': 0}, fh, indent=2)
+        return
+
+    logger.info(f"Proceeding with {len(variants)} variant sites.")
+
+    # Count alleles per cell
+    allele_counts = count_alleles_per_cell(
+        args.tagged_bam, variants, min_bq=args.min_base_quality)
+
+    if len(allele_counts) == 0:
+        logger.warning("No allele counts obtained. Exiting.")
+        pd.DataFrame().to_csv(args.output_ase, sep='\t', index=False)
+        with open(args.output_summary, 'w') as fh:
+            json.dump({'n_variants': len(variants), 'n_significant': 0},
+                      fh, indent=2)
+        return
+
+    # Filter by minimum total counts per variant-cell
+    allele_counts['total'] = (
+        allele_counts['ref_count'] + allele_counts['alt_count'])
+    allele_counts = allele_counts[
+        allele_counts['total'] >= args.min_total_counts].copy()
+    allele_counts = allele_counts.drop(columns=['total'])
+
+    # Filter variants by minimum cells
+    variant_cell_counts = allele_counts.groupby(
+        ['chrom', 'pos'])['barcode'].nunique().reset_index()
+    variant_cell_counts.columns = ['chrom', 'pos', 'n_cells']
+    passing_variants = variant_cell_counts[
+        variant_cell_counts['n_cells'] >= args.min_cells]
+    allele_counts = allele_counts.merge(
+        passing_variants[['chrom', 'pos']], on=['chrom', 'pos'])
+
+    logger.info(
+        f"After filtering: {allele_counts['barcode'].nunique()} cells, "
+        f"{len(passing_variants)} variants.")
+
+    # Load cluster assignments
+    clusters_df = pd.read_csv(args.clusters, sep='\t')
+    barcode_col = clusters_df.columns[0]
+    cluster_col = clusters_df.columns[1] \
+        if len(clusters_df.columns) > 1 else clusters_df.columns[0]
+    cluster_labels = pd.Series(
+        clusters_df[cluster_col].astype(str).values,
+        index=clusters_df[barcode_col].values)
+
+    # Aggregate by cluster and test
+    cluster_ase_df, diff_ase_df = aggregate_by_cluster(
+        allele_counts, cluster_labels)
+
+    # Write results
+    if len(cluster_ase_df) > 0:
+        cluster_ase_df.to_csv(args.output_ase, sep='\t', index=False)
+    else:
+        pd.DataFrame().to_csv(args.output_ase, sep='\t', index=False)
+
+    # Write differential ASE alongside
+    diff_output = str(args.output_ase).replace(
+        '.tsv', '_differential.tsv')
+    if len(diff_ase_df) > 0:
+        diff_ase_df.to_csv(diff_output, sep='\t', index=False)
+
+    # Summary
+    n_variants_tested = 0
+    n_sig_imbalance = 0
+    n_sig_differential = 0
+
+    if len(cluster_ase_df) > 0:
+        n_variants_tested = int(
+            cluster_ase_df.groupby(['chrom', 'pos']).ngroups)
+        n_sig_imbalance = int(
+            (cluster_ase_df['pvalue_adj'] <= args.fdr_threshold).sum())
+    if len(diff_ase_df) > 0:
+        n_sig_differential = int(
+            (diff_ase_df['fisher_pvalue_adj'] <= args.fdr_threshold).sum())
+
+    summary = {
+        'n_variants_input': len(variants),
+        'n_variants_passing_filters': int(len(passing_variants)),
+        'n_variants_tested': n_variants_tested,
+        'n_cells_with_allele_counts': int(
+            allele_counts['barcode'].nunique()),
+        'n_significant_imbalance': n_sig_imbalance,
+        'n_significant_differential': n_sig_differential,
+        'fdr_threshold': args.fdr_threshold,
+        'min_total_counts': args.min_total_counts,
+        'min_cells': args.min_cells,
+        'variant_source': 'vcf' if args.vcf else 'bam_pileup',
+    }
+    with open(args.output_summary, 'w') as fh:
+        json.dump(summary, fh, indent=2)
+
+    logger.info(
+        f"ASE analysis complete: {n_variants_tested} variants tested, "
+        f"{n_sig_imbalance} with significant imbalance, "
+        f"{n_sig_differential} with differential ASE between clusters.")

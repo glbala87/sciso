@@ -1,0 +1,12 @@
+__pycache__/
+*.egg-info/
+*.pyc
+dist/
+build/
+.eggs/
+*.h5ad
+*.bam
+*.bai
+iris_results/
+.nextflow*
+work/
