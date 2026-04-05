@@ -29,7 +29,7 @@ def argparser():
         "--out_dir", type=Path, required=True,
         help="sciso output directory (from `sciso run`).")
     parser.add_argument(
-        "--output_dir", type=Path, default="iris_figures",
+        "--output_dir", type=Path, default="sciso_figures",
         help="Directory where figures will be saved.")
     parser.add_argument(
         "--format", type=str, default="png",

@@ -67,7 +67,7 @@ def argparser():
         "--out_dir", type=Path, required=True,
         help="sciso output directory (from sciso run).")
     parser.add_argument(
-        "--output", type=Path, default="iris_report.html",
+        "--output", type=Path, default="sciso_report.html",
         help="Output HTML report path.")
 
     return parser

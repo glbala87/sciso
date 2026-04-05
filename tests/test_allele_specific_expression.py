@@ -12,27 +12,27 @@ class TestAllelicImbalance:
     def test_balanced_counts(self):
         """Balanced allele counts should not be significant."""
         from sciso.allele_specific_expression import (
-            test_allelic_imbalance)
+            compute_allelic_imbalance)
 
-        pval, ratio = test_allelic_imbalance(50, 50)
+        pval, ratio = compute_allelic_imbalance(50, 50)
         assert pval > 0.05
         assert ratio == pytest.approx(0.5)
 
     def test_imbalanced_counts(self):
         """Strongly imbalanced counts should be significant."""
         from sciso.allele_specific_expression import (
-            test_allelic_imbalance)
+            compute_allelic_imbalance)
 
-        pval, ratio = test_allelic_imbalance(95, 5)
+        pval, ratio = compute_allelic_imbalance(95, 5)
         assert pval < 0.05
         assert ratio == pytest.approx(0.05)
 
     def test_zero_counts(self):
         """Zero total counts should return p=1 and NaN ratio."""
         from sciso.allele_specific_expression import (
-            test_allelic_imbalance)
+            compute_allelic_imbalance)
 
-        pval, ratio = test_allelic_imbalance(0, 0)
+        pval, ratio = compute_allelic_imbalance(0, 0)
         assert pval == 1.0
         assert np.isnan(ratio)
 

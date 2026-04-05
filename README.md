@@ -21,7 +21,7 @@ sciso accepts standard MEX matrices from **any** upstream preprocessing pipeline
 | Capability | sciso | Scanpy | Seurat | Cell Ranger | FLAMES | IsoQuant |
 |-----------|-------|--------|--------|-------------|--------|----------|
 | Isoform-usage clustering | **Yes** | No | No | No | No | No |
-| Joint gene+isoform embedding | **Yes** | No | No | No | No | No |
+| Joint gene+isoform embedding (graph fusion) | **Yes** | No | No | No | No | No |
 | Differential transcript usage (single-cell) | **Yes** | No | No | No | No | No |
 | Isoform switching detection | **Yes** | No | No | No | No | No |
 | Cluster-specific novel isoforms | **Yes** | No | No | No | No | No |
@@ -38,7 +38,10 @@ sciso accepts standard MEX matrices from **any** upstream preprocessing pipeline
 pip install sciso
 
 # With all optional features (ASE, plotting, Leiden)
-pip install sciso[all]
+pip install "sciso[all]"
+
+# ASE module only (requires pysam)
+pip install "sciso[ase]"
 
 # Development install from source
 git clone https://github.com/sciso/sciso.git
@@ -48,7 +51,7 @@ pip install -e ".[all,dev]"
 
 ### Requirements
 
-- Python >= 3.9
+- Python >= 3.9 (tested on 3.9, 3.10, 3.11, 3.12, 3.13)
 - Core: numpy, pandas, scipy, scikit-learn, scanpy, anndata, igraph, umap-learn
 - Optional: pysam (for ASE), plotly (for reports), leidenalg (for Leiden clustering)
 
@@ -79,7 +82,7 @@ sciso run \
     --species human
 ```
 
-This runs all modules in sequence: validation, dual-layer clustering, cell type annotation, DTU, trajectory, and exports a unified `.h5ad`.
+This runs all modules in sequence: validation, clustering, dual-layer clustering, cell type annotation, DTU, trajectory, and exports a unified `.h5ad`.
 
 ### Load results in Python
 
@@ -171,14 +174,14 @@ sciso run \
 
 ---
 
-### `sciso dual-cluster` — Dual-Layer Clustering
+### `sciso dual-cluster` -- Dual-Layer Clustering
 
-Clusters cells at two independent levels, then computes a joint embedding:
+Clusters cells at two independent levels, then computes a joint embedding via KNN graph fusion:
 
-1. **Gene expression clustering** — standard Scanpy pipeline (normalize, HVG, PCA, KNN, Louvain/Leiden, UMAP)
-2. **Isoform usage clustering** — computes per-cell transcript proportions within each gene, then clusters by these splicing patterns (scale, PCA, KNN, Louvain/Leiden, UMAP)
-3. **Joint embedding** — concatenates gene and isoform PCA spaces, runs KNN + clustering + UMAP on the combined latent space
-4. **Cluster comparison** — computes ARI and NMI between gene-level and isoform-level clusterings, identifies isoform-specific clusters
+1. **Gene expression clustering** -- standard Scanpy pipeline (normalize, HVG, PCA, KNN, Louvain/Leiden, UMAP)
+2. **Isoform usage clustering** -- computes per-cell transcript proportions within each gene, then clusters by these splicing patterns (scale, PCA, KNN, Louvain/Leiden, UMAP)
+3. **Joint embedding** -- builds separate KNN graphs in gene and isoform PCA space, then merges them as a weighted combination of connectivity matrices (WNN-inspired graph fusion). The `--isoform_weight` parameter controls the relative influence of isoform-level structure.
+4. **Cluster comparison** -- computes ARI and NMI between gene-level and isoform-level clusterings, identifies isoform-specific clusters
 
 ```bash
 sciso dual-cluster gene_matrix/ transcript_matrix/ \
@@ -186,22 +189,25 @@ sciso dual-cluster gene_matrix/ transcript_matrix/ \
     --cluster_method louvain \
     --resolution 0.8 \
     --isoform_resolution 1.0 \
+    --isoform_weight 3.0 \
     --n_neighbors 15 \
     --n_pcs 50 \
     --diversity_metric shannon
 ```
 
+The `--isoform_weight` parameter (default 3.0) controls the balance between gene expression and isoform usage in the joint embedding. At 3.0, the fused graph is 75% isoform / 25% gene. Increase this when isoform usage is the primary driver of cell-state differences; decrease when gene expression is more informative.
+
 **Outputs:** `gene_clusters.tsv`, `isoform_clusters.tsv`, `joint_clusters.tsv`, `joint.umap.tsv`, `isoform_diversity.tsv`, `cluster_comparison.json`
 
 ---
 
-### `sciso dtu` — Differential Transcript Usage
+### `sciso dtu` -- Differential Transcript Usage
 
 Tests whether different cell clusters preferentially use different transcript isoforms for the same gene, even when total gene expression is unchanged.
 
 **Methods:**
-- **Chi-squared test** (default) — builds a 2 x n_isoforms contingency table per gene, tests independence of cluster identity and isoform choice
-- **Dirichlet-multinomial test** — fits DM models per cluster, likelihood ratio test for differential isoform proportions. Handles overdispersion in single-cell data.
+- **Chi-squared test** (default) -- builds a 2 x n_isoforms contingency table per gene, tests independence of cluster identity and isoform choice. Uses Yates' continuity correction for robustness with small counts.
+- **Dirichlet-multinomial test** -- fits DM models per cluster, likelihood ratio test for differential isoform proportions. Handles overdispersion in single-cell data.
 
 **Isoform switching:** for each significant DTU gene, checks if the dominant transcript changes between clusters.
 
@@ -219,17 +225,17 @@ sciso dtu transcript_matrix/ \
 
 ---
 
-### `sciso novel-isoforms` — Novel Isoform Discovery
+### `sciso novel-isoforms` -- Novel Isoform Discovery
 
 Identifies novel transcript isoforms from StringTie/gffcompare assemblies that are enriched in specific cell clusters.
 
 Uses gffcompare class codes:
-- `j` — novel junction-sharing isoform (shares splice site with reference)
-- `u` — intergenic (completely novel, no reference overlap)
-- `o` — generic exonic overlap with reference
-- `x` — exonic overlap on opposite strand (antisense)
+- `j` -- novel junction-sharing isoform (shares splice site with reference)
+- `u` -- intergenic (completely novel, no reference overlap)
+- `o` -- generic exonic overlap with reference
+- `x` -- exonic overlap on opposite strand (antisense)
 
-For each novel isoform, tests cluster enrichment using Fisher's exact test, then computes a specificity score based on fold enrichment and entropy of the cluster distribution.
+For each novel isoform, tests cluster enrichment using Fisher's exact test, then computes a specificity score: `log2(fold_enrichment + 1) * (1 - normalized_entropy)`. This preserves fold-change magnitude for moderately distributed isoforms while penalizing broadly expressed ones.
 
 ```bash
 sciso novel-isoforms transcript_matrix/ \
@@ -245,13 +251,13 @@ sciso novel-isoforms transcript_matrix/ \
 
 ---
 
-### `sciso annotate` — Cell Type Annotation
+### `sciso annotate` -- Cell Type Annotation
 
 Automated cell type annotation using marker gene databases.
 
 **Methods:**
-- **Marker overlap** (default) — for each cluster, counts detected marker genes per cell type, scores by n_detected x mean_expression
-- **Correlation** — correlates cluster mean expression profiles with binary reference profiles (Pearson)
+- **Marker overlap** (default) -- for each cluster, counts detected marker genes per cell type, scores by n_detected x mean_expression
+- **Correlation** -- correlates cluster mean expression profiles with binary reference profiles (Pearson)
 
 Built-in marker databases for human and mouse (12 cell types: T cells, B cells, NK cells, monocytes, dendritic cells, platelets, erythrocytes, fibroblasts, epithelial, endothelial, macrophages, neutrophils). Custom marker TSV supported.
 
@@ -272,13 +278,13 @@ sciso annotate gene_matrix/ \
 
 ---
 
-### `sciso trajectory` — Isoform Trajectory Analysis
+### `sciso trajectory` -- Isoform Trajectory Analysis
 
 Computes diffusion pseudotime from gene expression, then tracks how isoform usage proportions change along the trajectory.
 
-1. **Diffusion pseudotime** — normalize, HVG, PCA, diffusion map, DPT (auto-selects root cell)
-2. **Isoform trends** — bins cells by pseudotime, computes mean isoform proportions per bin, Spearman correlation with pseudotime
-3. **Trajectory switching** — identifies genes where opposing isoform trends indicate a dominant transcript change during differentiation
+1. **Diffusion pseudotime** -- normalize, HVG, PCA, diffusion map, DPT (auto-selects root cell)
+2. **Isoform trends** -- bins cells by pseudotime, computes aggregate isoform proportions per bin, Spearman correlation with pseudotime
+3. **Trajectory switching** -- identifies genes where opposing isoform trends indicate a dominant transcript change during differentiation
 
 ```bash
 sciso trajectory gene_matrix/ \
@@ -293,14 +299,16 @@ sciso trajectory gene_matrix/ \
 
 ---
 
-### `sciso ase` — Allele-Specific Expression
+### `sciso ase` -- Allele-Specific Expression
 
 Detects allelic imbalance at heterozygous sites using long-read phasing. Long reads span multiple SNPs per cell, enabling haplotype-resolved expression analysis.
 
-1. **Variant discovery** — scans BAM pileups for het positions (or loads from VCF)
-2. **Per-cell allele counting** — counts ref/alt alleles per cell per variant using CB tags
-3. **Imbalance testing** — binomial test (H0: balanced, p=0.5) per variant per cluster
-4. **Differential ASE** — Fisher's exact test for allelic ratio differences between clusters
+> **Note:** Requires `pip install "sciso[ase]"` for pysam. Does not require MD tags in the BAM file.
+
+1. **Variant discovery** -- scans BAM pileups for het positions (or loads from VCF)
+2. **Per-cell allele counting** -- counts ref/alt alleles per cell per variant using CB tags
+3. **Imbalance testing** -- binomial test (H0: balanced, p=0.5) per variant per cluster
+4. **Differential ASE** -- Fisher's exact test for allelic ratio differences between clusters
 
 ```bash
 sciso ase tagged.bam \
@@ -315,14 +323,14 @@ sciso ase tagged.bam \
 
 ---
 
-### `sciso compare` — Multi-Sample Comparison
+### `sciso compare` -- Multi-Sample Comparison
 
 Compares results across multiple samples to identify conserved vs sample-specific findings.
 
-- **Conserved DTU** — genes with significant DTU in all samples
-- **Shared novel isoforms** — novel transcripts present across samples
-- **Conserved switching** — same isoform switch in multiple samples
-- **Cell type composition** — Fisher's exact test for differential composition
+- **Conserved DTU** -- genes with significant DTU in all samples
+- **Shared novel isoforms** -- novel transcripts present across samples
+- **Conserved switching** -- same isoform switch in multiple samples
+- **Cell type composition** -- Fisher's exact test for differential composition
 
 ```bash
 sciso compare \
@@ -335,14 +343,14 @@ sciso compare \
 
 ---
 
-### `sciso plot` — Publication Figures
+### `sciso plot` -- Publication Figures
 
 Generates publication-quality figures from sciso results.
 
 ```bash
 sciso plot \
     --out_dir sciso_results/ \
-    --output_dir figures/ \
+    --output_dir sciso_figures/ \
     --format pdf \
     --dpi 300 \
     --style publication
@@ -365,7 +373,7 @@ Styles: `publication` (Nature/Cell formatting) or `presentation` (larger fonts).
 
 ---
 
-### `sciso export` — AnnData Export
+### `sciso export` -- AnnData Export
 
 Exports all results into a single `.h5ad` file for downstream analysis in Scanpy or any AnnData-compatible tool.
 
@@ -384,54 +392,66 @@ sciso export gene_matrix/ \
 
 **h5ad structure:**
 ```
-adata.X                  → gene expression matrix (sparse)
-adata.layers['counts']   → raw counts
-adata.obs                → gene_cluster, isoform_cluster, joint_cluster,
+adata.X                  -> gene expression matrix (sparse)
+adata.layers['counts']   -> raw counts
+adata.obs                -> gene_cluster, isoform_cluster, joint_cluster,
                            cell_type, diversity_index, dpt_pseudotime
-adata.obsm['X_umap']     → joint UMAP embedding
-adata.uns['dtu_results'] → DTU test results DataFrame
-adata.uns['switching_results'] → isoform switching events
-adata.uns['cluster_comparison'] → ARI/NMI comparison stats
+adata.obsm['X_umap']     -> joint UMAP embedding
+adata.uns['dtu_results'] -> DTU test results DataFrame
+adata.uns['switching_results'] -> isoform switching events
+adata.uns['cluster_comparison'] -> ARI/NMI comparison stats (JSON string)
 ```
 
 ## Methodology
 
-### Dual-Layer Clustering
+### Dual-Layer Clustering with Graph Fusion
 
 ```
 Gene Expression Matrix              Transcript Expression Matrix
-(cells × genes)                     (cells × transcripts)
-        │                                    │
-        ▼                                    ▼
+(cells x genes)                     (cells x transcripts)
+        |                                    |
+        v                                    v
    Normalize                         Compute isoform usage
    Log1p                             proportions per gene
    HVG selection                     (transcript / gene total)
-        │                                    │
-        ▼                                    ▼
+        |                                    |
+        v                                    v
       PCA                                  PCA
    (gene space)                      (isoform usage space)
-        │                                    │
-        ├────────── Concatenate ─────────────┤
-        │                                    │
-        ▼                                    ▼
+        |                                    |
+        v                                    v
+   Gene KNN graph                    Isoform KNN graph
+        |                                    |
+        +--------- Graph Fusion ------------+
+        |     (weighted combination of       |
+        |      connectivity matrices)        |
+        v                                    v
    Gene clusters                    Isoform clusters
    (Louvain/Leiden)                 (Louvain/Leiden)
-        │                                    │
-        └──────────── Compare ───────────────┘
+        |                                    |
+        +------------ Compare --------------+
                    ARI, NMI
                    Isoform-specific clusters
-                         │
-                         ▼
+                         |
+                         v
                   Joint Embedding
-                  (concat PCA → KNN → cluster → UMAP)
+             (cluster + UMAP on fused graph)
 ```
+
+The joint embedding uses **KNN graph fusion** inspired by Seurat v4 WNN (Hao et al., Cell 2021). Instead of concatenating PCA spaces (which suffers from the curse of dimensionality when one modality carries noise), separate KNN graphs are built in gene and isoform space. The graphs are merged as a weighted combination:
+
+```
+W_joint = (1 / (1 + w)) * W_gene + (w / (1 + w)) * W_iso
+```
+
+where `w` is the `--isoform_weight` parameter (default 3.0, giving 75% isoform / 25% gene). This preserves cell-state structure from whichever modality defines it.
 
 **Key insight:** Cells that express the same genes at the same level can still differ in *how* they splice those genes. Isoform-usage clustering captures this splicing-driven heterogeneity that gene-level analysis misses.
 
 ### Isoform Diversity Index
 
 For each cell, for each multi-isoform gene:
-- Shannon entropy: H = -Σ(p × log₂(p)) where p = proportion of each isoform
+- Shannon entropy: H = -sum(p * log2(p)) where p = proportion of each isoform
 - Averaged across all expressed multi-isoform genes
 
 High diversity = cell uses many isoforms roughly equally.
@@ -439,40 +459,46 @@ Low diversity = cell preferentially uses one dominant isoform.
 
 ### Differential Transcript Usage
 
-For each gene with ≥2 expressed isoforms, tests whether isoform proportions differ between clusters:
+For each gene with >= 2 expressed isoforms, tests whether isoform proportions differ between clusters:
 
-**Chi-squared test:**
+**Chi-squared test (with Yates' continuity correction):**
 ```
                   Isoform A    Isoform B    Isoform C
 Cluster 1:          120           30            50
 Cluster 2:           40          100            60
-                            ↓
-              χ² contingency test → p-value → BH correction
+                            |
+              chi2 contingency test -> p-value -> BH correction
 ```
+
+Effect size: Cramer's V. Multiple testing correction: Benjamini-Hochberg FDR.
 
 **Isoform switching:** detected when the dominant transcript changes between clusters (e.g., Gene X uses isoform A in T cells but isoform B in B cells).
 
 ### Novel Isoform Discovery
 
 ```
-StringTie assembly → gffcompare vs reference → class codes
-                                                    │
-              ┌─────────────────────────────────────┤
-              ▼                                     ▼
+StringTie assembly -> gffcompare vs reference -> class codes
+                                                    |
+              +-------------------------------------+
+              v                                     v
          Known (=, c)                        Novel (j, u, o, x)
-                                                    │
-                                                    ▼
+                                                    |
+                                                    v
                                       Cross-reference with
                                       transcript expression matrix
-                                                    │
-                                                    ▼
+                                                    |
+                                                    v
                                       Fisher's exact test for
                                       cluster enrichment
-                                                    │
-                                                    ▼
+                                                    |
+                                                    v
                                       Specificity score:
-                                      fold_enrichment × (1 - entropy)
+                                      log2(fold+1) * (1 - entropy)
 ```
+
+### Memory Safety
+
+All sparse-to-dense matrix conversions include a memory guard (default 2 GB limit). If densifying a matrix would exceed this limit, a clear `MemoryError` is raised with the estimated size.
 
 ## Pipeline Features
 
@@ -512,6 +538,7 @@ sciso validate \
 Checks:
 - MEX directory structure (matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz)
 - Barcode overlap between gene and transcript matrices
+- Duplicate barcode detection
 - BAM index existence and CB tag presence
 - TSV column validation
 
@@ -531,20 +558,32 @@ sciso has been validated on the PBMC 3k benchmark dataset (2,700 cells, 32,738 g
 
 | Metric | Result |
 |--------|--------|
+| Pipeline steps completed | **8/8** |
 | Gene clusters | 8 |
 | Isoform clusters | 15 |
-| Joint clusters | 7 |
+| Joint clusters | 5-7 |
 | ARI (gene vs isoform) | 0.23 (confirms distinct structure) |
+| Isoform clusters vs ground truth | ARI = 0.49, NMI = 0.71 |
 | Isoform-specific clusters | 1 |
 | Cell types annotated | T cells (1,211), NK cells (432), B cells (344) |
-| DTU genes (FDR < 0.05) | 277 |
-| Isoform switching events | 17,214 |
+| DTU genes (FDR < 0.05) | 280 |
+| Isoform switching events | 16,468 |
+| Novel isoforms cataloged | 4,992 |
+| Cluster-enriched novel isoforms | 2,479 |
 | Dynamic isoforms along trajectory | 3,996 |
-| Pipeline runtime | ~3 minutes |
+| ASE variants tested | 200 input |
+| Pipeline runtime | ~3 minutes (2,700 cells) |
+
+### Known Limitations
+
+- **Validated on 2,700-cell dataset.** Large datasets (100k+ cells) will hit the 2 GB memory guard on matrix densification -- reduce features or cells first.
+- **Joint embedding vs isoform-only.** When gene expression carries no cell-state signal, isoform-only clusters will outperform the joint embedding. This is expected -- the joint embedding is most valuable when both modalities contribute information.
+- **ASE requires pysam.** Install with `pip install "sciso[ase]"`. The module does not require MD tags in the BAM.
+- **Chi-squared DTU uses Yates' continuity correction.** This is more conservative than an uncorrected test, which is appropriate for the sparse contingency tables common in single-cell data.
 
 ## Nextflow
 
-sciso includes a Nextflow wrapper for HPC/cloud execution:
+sciso includes a Nextflow wrapper for HPC/cloud execution with automatic memory scaling and OOM retry:
 
 ```bash
 nextflow run sciso/nextflow/main.nf \
@@ -560,6 +599,8 @@ nextflow run sciso/nextflow/main.nf \
 ```
 
 Profiles: `conda`, `docker`, `singularity`
+
+Each process uses dynamic memory allocation (`memory { base * task.attempt }`) with automatic retry on OOM (exit codes 137, 140).
 
 ## CLI Reference
 
@@ -615,7 +656,10 @@ sciso run --help
 | `isoform_dynamics.tsv` | Isoform trend statistics along trajectory |
 | `trajectory_switching.tsv` | Trajectory switching events |
 | `ase_results.tsv` | Allele-specific expression results |
+| `clusters.tsv` | Basic Scanpy cluster assignments |
+| `marker_genes.tsv` | Marker genes per cluster |
 | `sciso.log` | Full pipeline log |
+| `sciso_pipeline_summary.json` | Pipeline execution summary |
 
 ## Testing
 
@@ -623,7 +667,10 @@ sciso run --help
 # Run all tests
 python -m pytest tests/ -v
 
-# Current: 121 passed, 2 skipped
+# Run with coverage
+python -m pytest tests/ -v --cov=sciso --cov-report=term-missing
+
+# Current: 136 passed, 2 skipped
 ```
 
 ## License

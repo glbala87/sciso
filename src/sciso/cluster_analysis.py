@@ -239,7 +239,14 @@ def run_clustering(adata, args):
     adata.raw = adata
     adata = adata[:, adata.var.highly_variable].copy()
 
-    # Scale (Seurat ScaleData)
+    # Scale (Seurat ScaleData) — requires dense matrix
+    if scipy.sparse.issparse(adata.X):
+        est_bytes = adata.shape[0] * adata.shape[1] * 8
+        if est_bytes > 2 * 1024 ** 3:
+            raise MemoryError(
+                f"Scaling {adata.shape} matrix would require "
+                f"~{est_bytes / 1e9:.1f} GB. Reduce cells or features.")
+        adata.X = adata.X.toarray()
     sc.pp.scale(adata, max_value=10)
 
     # PCA (Seurat RunPCA)
@@ -258,9 +265,13 @@ def run_clustering(adata, args):
         f"Clustering with {args.cluster_method} "
         f"(resolution={args.resolution}).")
     if args.cluster_method == "leiden":
-        sc.tl.leiden(adata, resolution=args.resolution, key_added='cluster')
+        sc.tl.leiden(
+            adata, resolution=args.resolution, key_added='cluster',
+            flavor='igraph', n_iterations=2, directed=False)
     else:
-        sc.tl.louvain(adata, resolution=args.resolution, key_added='cluster')
+        sc.tl.louvain(
+            adata, resolution=args.resolution, key_added='cluster',
+            flavor='igraph')
 
     # UMAP (Seurat RunUMAP)
     logger.info("Computing UMAP embedding.")

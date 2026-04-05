@@ -186,7 +186,8 @@ def compute_isoform_trends(adata_tx, gene_map, pseudotime, n_bins=10):
 
     # Bin cells by pseudotime
     bin_edges = np.linspace(pt_values.min(), pt_values.max(), n_bins + 1)
-    bin_labels = np.digitize(pt_values, bin_edges[1:-1])
+    bin_labels = np.clip(
+        np.digitize(pt_values, bin_edges) - 1, 0, n_bins - 1)
     bin_midpoints = (bin_edges[:-1] + bin_edges[1:]) / 2.0
 
     # Build gene -> transcript mapping
@@ -228,7 +229,7 @@ def compute_isoform_trends(adata_tx, gene_map, pseudotime, n_bins=10):
 
             bin_total = bin_expr.sum()
             if bin_total > 0:
-                bin_proportions[b] = bin_expr.mean(axis=0)
+                bin_proportions[b] = bin_expr.sum(axis=0)
                 row_total = bin_proportions[b].sum()
                 if row_total > 0:
                     bin_proportions[b] /= row_total
@@ -339,33 +340,7 @@ def detect_trajectory_switching(trends_df, pval_threshold=0.05):
     return switching_df
 
 
-def _bh_correct(pvalues):
-    """Benjamini-Hochberg FDR correction."""
-    pvalues = np.asarray(pvalues, dtype=float)
-    n = len(pvalues)
-    if n == 0:
-        return pvalues
-
-    valid = ~np.isnan(pvalues)
-    adjusted = np.full_like(pvalues, np.nan)
-
-    if valid.sum() == 0:
-        return adjusted
-
-    valid_p = pvalues[valid]
-    sort_idx = np.argsort(valid_p)
-    sorted_p = valid_p[sort_idx]
-    ranks = np.arange(1, len(sorted_p) + 1)
-    adj_sorted = sorted_p * len(sorted_p) / ranks
-
-    # Enforce monotonicity
-    for i in range(len(adj_sorted) - 2, -1, -1):
-        adj_sorted[i] = min(adj_sorted[i], adj_sorted[i + 1])
-    adj_sorted = np.minimum(adj_sorted, 1.0)
-
-    unsort_idx = np.argsort(sort_idx)
-    adjusted[valid] = adj_sorted[unsort_idx]
-    return adjusted
+from ._stats import bh_correct as _bh_correct
 
 
 def main(args):

@@ -138,7 +138,10 @@ def chi_squared_dtu_test(counts_a, counts_b):
         return np.nan, np.nan, 0.0
 
     try:
-        chi2, pvalue, dof, _ = scipy.stats.chi2_contingency(contingency)
+        # Use correction=True for Yates' continuity correction,
+        # important for sparse contingency tables with small counts
+        chi2, pvalue, dof, _ = scipy.stats.chi2_contingency(
+            contingency, correction=True)
     except ValueError:
         return np.nan, np.nan, 0.0
 
@@ -250,11 +253,15 @@ def dirichlet_multinomial_test(counts_a, counts_b):
 
         return lr_stat, pvalue, effect_size
 
-    except Exception:
-        # Fall back to chi-squared test on aggregated counts
+    except (ValueError, RuntimeError, np.linalg.LinAlgError,
+            FloatingPointError):
+        # Optimization failed — fall back to chi-squared on aggregated counts
         agg_a = counts_a.sum(axis=0)
         agg_b = counts_b.sum(axis=0)
         return chi_squared_dtu_test(agg_a, agg_b)
+
+
+from ._stats import bh_correct
 
 
 def correct_pvalues(pvalues, method='fdr_bh'):
@@ -266,38 +273,7 @@ def correct_pvalues(pvalues, method='fdr_bh'):
     :param method: correction method (only 'fdr_bh' implemented).
     :returns: array of adjusted p-values.
     """
-    pvalues = np.asarray(pvalues, dtype=float)
-    adjusted = np.full_like(pvalues, np.nan)
-
-    # Identify valid (non-NaN) p-values
-    valid_mask = ~np.isnan(pvalues)
-    if valid_mask.sum() == 0:
-        return adjusted
-
-    valid_pvals = pvalues[valid_mask]
-    n = len(valid_pvals)
-
-    # Sort p-values
-    sort_idx = np.argsort(valid_pvals)
-    sorted_pvals = valid_pvals[sort_idx]
-
-    # BH adjustment: p_adj[i] = p[i] * n / rank[i]
-    ranks = np.arange(1, n + 1)
-    adjusted_sorted = sorted_pvals * n / ranks
-
-    # Enforce monotonicity (from largest to smallest)
-    for i in range(n - 2, -1, -1):
-        adjusted_sorted[i] = min(adjusted_sorted[i], adjusted_sorted[i + 1])
-
-    # Cap at 1.0
-    adjusted_sorted = np.minimum(adjusted_sorted, 1.0)
-
-    # Unsort
-    unsort_idx = np.argsort(sort_idx)
-    valid_adjusted = adjusted_sorted[unsort_idx]
-    adjusted[valid_mask] = valid_adjusted
-
-    return adjusted
+    return bh_correct(pvalues)
 
 
 def detect_isoform_switching(counts_a, counts_b, transcript_names):

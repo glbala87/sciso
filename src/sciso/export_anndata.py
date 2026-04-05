@@ -66,7 +66,7 @@ def argparser():
         "--ase_results", type=Path, default=None,
         help="TSV with allele-specific expression results.")
     parser.add_argument(
-        "--output", type=Path, default="isosceles.h5ad",
+        "--output", type=Path, default="sciso.h5ad",
         help="Output h5ad file path.")
 
     return parser
@@ -192,9 +192,12 @@ def add_cell_metadata(adata, tsv_file, columns=None):
 def add_uns_dataframe(adata, key, tsv_file):
     """Store a DataFrame in adata.uns for non-per-cell results.
 
+    Supports both TSV and JSON files. JSON files are stored as
+    serialized strings since h5ad has limited support for nested dicts.
+
     :param adata: AnnData object.
     :param key: key in adata.uns.
-    :param tsv_file: Path to TSV file.
+    :param tsv_file: Path to TSV or JSON file.
     :returns: adata with added uns entry.
     """
     logger = get_named_logger("UnsData")
@@ -202,11 +205,34 @@ def add_uns_dataframe(adata, key, tsv_file):
     if tsv_file is None or not Path(tsv_file).exists():
         return adata
 
-    df = pd.read_csv(tsv_file, sep='\t')
-    adata.uns[key] = df
-    logger.info(
-        f"Added uns['{key}']: {df.shape[0]} rows x {df.shape[1]} cols "
-        f"from {tsv_file}.")
+    tsv_path = Path(tsv_file)
+
+    if tsv_path.suffix == '.json':
+        # Store JSON as a serialized string for h5ad compatibility
+        with open(tsv_path) as fh:
+            data = json.load(fh)
+        adata.uns[key] = json.dumps(data)
+        logger.info(
+            f"Added uns['{key}']: JSON from {tsv_file}.")
+    else:
+        try:
+            df = pd.read_csv(tsv_file, sep='\t')
+        except pd.errors.EmptyDataError:
+            logger.info(
+                f"Skipping uns['{key}']: empty file {tsv_file}.")
+            return adata
+        if len(df) == 0:
+            logger.info(
+                f"Skipping uns['{key}']: no data rows in {tsv_file}.")
+            return adata
+        # Ensure all columns have consistent types for h5ad
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].astype(str)
+        adata.uns[key] = df
+        logger.info(
+            f"Added uns['{key}']: {df.shape[0]} rows x {df.shape[1]} cols "
+            f"from {tsv_file}.")
     return adata
 
 

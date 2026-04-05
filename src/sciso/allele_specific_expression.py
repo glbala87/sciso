@@ -64,56 +64,66 @@ def extract_variants_from_bam(bam_path, min_bq=20, min_cov=10):
     :param min_cov: minimum coverage to evaluate a position.
     :returns: DataFrame with columns chrom, pos, ref, alt.
     """
-    import pysam
+    try:
+        import pysam
+    except ImportError:
+        raise ImportError(
+            "pysam is required for ASE analysis. "
+            "Install with: pip install sciso[ase]")
 
     logger = get_named_logger("Variants")
     logger.info(f"Discovering heterozygous variants from {bam_path}.")
 
     variants = []
-    bam = pysam.AlignmentFile(str(bam_path), 'rb')
+    try:
+        bam = pysam.AlignmentFile(str(bam_path), 'rb')
+    except (OSError, ValueError) as e:
+        logger.error(f"Cannot open BAM file {bam_path}: {e}")
+        return pd.DataFrame(columns=['chrom', 'pos', 'ref', 'alt'])
 
-    for pileup_col in bam.pileup(
-            min_base_quality=min_bq,
-            truncate=True,
-            stepper='samtools'):
+    try:
+        for pileup_col in bam.pileup(
+                min_base_quality=min_bq,
+                truncate=True,
+                stepper='nofilter'):
 
-        chrom = pileup_col.reference_name
-        pos = pileup_col.reference_pos
+            chrom = pileup_col.reference_name
+            pos = pileup_col.reference_pos
 
-        allele_counts = {}
-        for read in pileup_col.pileups:
-            if read.is_del or read.is_refskip:
+            allele_counts = {}
+            for read in pileup_col.pileups:
+                if read.is_del or read.is_refskip:
+                    continue
+                base = read.alignment.query_sequence[read.query_position]
+                base = base.upper()
+                if base not in 'ACGT':
+                    continue
+                allele_counts[base] = allele_counts.get(base, 0) + 1
+
+            total = sum(allele_counts.values())
+            if total < min_cov:
                 continue
-            base = read.alignment.query_sequence[read.query_position]
-            base = base.upper()
-            if base not in 'ACGT':
+
+            # Identify two most common alleles
+            sorted_alleles = sorted(
+                allele_counts.items(), key=lambda x: -x[1])
+            if len(sorted_alleles) < 2:
                 continue
-            allele_counts[base] = allele_counts.get(base, 0) + 1
 
-        total = sum(allele_counts.values())
-        if total < min_cov:
-            continue
+            top_base, top_count = sorted_alleles[0]
+            sec_base, sec_count = sorted_alleles[1]
 
-        # Identify two most common alleles
-        sorted_alleles = sorted(
-            allele_counts.items(), key=lambda x: -x[1])
-        if len(sorted_alleles) < 2:
-            continue
-
-        top_base, top_count = sorted_alleles[0]
-        sec_base, sec_count = sorted_alleles[1]
-
-        # Both alleles must be at least 20% frequency
-        if (top_count / total >= 0.20
-                and sec_count / total >= 0.20):
-            variants.append({
-                'chrom': chrom,
-                'pos': pos,
-                'ref': top_base,
-                'alt': sec_base,
-            })
-
-    bam.close()
+            # Both alleles must be at least 20% frequency
+            if (top_count / total >= 0.20
+                    and sec_count / total >= 0.20):
+                variants.append({
+                    'chrom': chrom,
+                    'pos': pos,
+                    'ref': top_base,
+                    'alt': sec_base,
+                })
+    finally:
+        bam.close()
 
     variant_df = pd.DataFrame(variants)
     logger.info(f"Discovered {len(variant_df)} heterozygous positions.")
@@ -189,60 +199,74 @@ def count_alleles_per_cell(bam_path, variants, min_bq=20):
     :param min_bq: minimum base quality for counting.
     :returns: DataFrame with chrom, pos, barcode, ref_count, alt_count.
     """
-    import pysam
+    try:
+        import pysam
+    except ImportError:
+        raise ImportError(
+            "pysam is required for ASE analysis. "
+            "Install with: pip install sciso[ase]")
 
     logger = get_named_logger("AlleleCt")
     logger.info(
         f"Counting alleles per cell at {len(variants)} variant sites.")
 
-    bam = pysam.AlignmentFile(str(bam_path), 'rb')
+    try:
+        bam = pysam.AlignmentFile(str(bam_path), 'rb')
+    except (OSError, ValueError) as e:
+        logger.error(f"Cannot open BAM file {bam_path}: {e}")
+        return pd.DataFrame(
+            columns=['chrom', 'pos', 'barcode', 'ref_count', 'alt_count'])
+
     records = []
 
-    for _, var in variants.iterrows():
-        chrom = var['chrom']
-        pos = int(var['pos'])
-        ref_base = var['ref'].upper()
-        alt_base = var['alt'].upper()
+    try:
+        for _, var in variants.iterrows():
+            chrom = var['chrom']
+            pos = int(var['pos'])
+            ref_base = var['ref'].upper()
+            alt_base = var['alt'].upper()
 
-        cell_alleles = {}  # barcode -> [ref_count, alt_count]
+            cell_alleles = {}  # barcode -> [ref_count, alt_count]
 
-        for read in bam.fetch(chrom, pos, pos + 1):
-            if read.is_unmapped or read.is_secondary or read.is_supplementary:
-                continue
+            for read in bam.fetch(chrom, pos, pos + 1):
+                if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                    continue
 
-            # Get cell barcode
-            try:
-                barcode = read.get_tag('CB')
-            except KeyError:
-                continue
+                # Get cell barcode
+                try:
+                    barcode = read.get_tag('CB')
+                except KeyError:
+                    continue
 
-            # Get base at variant position
-            pairs = read.get_aligned_pairs(with_seq=True)
-            for query_pos, ref_pos, ref_seq in pairs:
-                if ref_pos == pos and query_pos is not None:
-                    base_qual = read.query_qualities[query_pos]
-                    if base_qual < min_bq:
+                # Get base at variant position using aligned pairs
+                # Use with_seq=False to avoid requiring MD tags
+                pairs = read.get_aligned_pairs(with_seq=False)
+                for query_pos, ref_pos in pairs:
+                    if ref_pos == pos and query_pos is not None:
+                        if read.query_qualities is not None:
+                            base_qual = read.query_qualities[query_pos]
+                            if base_qual < min_bq:
+                                break
+                        query_base = read.query_sequence[query_pos].upper()
+                        if barcode not in cell_alleles:
+                            cell_alleles[barcode] = [0, 0]
+                        if query_base == ref_base:
+                            cell_alleles[barcode][0] += 1
+                        elif query_base == alt_base:
+                            cell_alleles[barcode][1] += 1
                         break
-                    query_base = read.query_sequence[query_pos].upper()
-                    if barcode not in cell_alleles:
-                        cell_alleles[barcode] = [0, 0]
-                    if query_base == ref_base:
-                        cell_alleles[barcode][0] += 1
-                    elif query_base == alt_base:
-                        cell_alleles[barcode][1] += 1
-                    break
 
-        for barcode, (rc, ac) in cell_alleles.items():
-            if rc + ac > 0:
-                records.append({
-                    'chrom': chrom,
-                    'pos': pos,
-                    'barcode': barcode,
-                    'ref_count': rc,
-                    'alt_count': ac,
-                })
-
-    bam.close()
+            for barcode, (rc, ac) in cell_alleles.items():
+                if rc + ac > 0:
+                    records.append({
+                        'chrom': chrom,
+                        'pos': pos,
+                        'barcode': barcode,
+                        'ref_count': rc,
+                        'alt_count': ac,
+                    })
+    finally:
+        bam.close()
 
     allele_df = pd.DataFrame(records)
     logger.info(
@@ -252,7 +276,7 @@ def count_alleles_per_cell(bam_path, variants, min_bq=20):
     return allele_df
 
 
-def test_allelic_imbalance(ref_count, alt_count):
+def compute_allelic_imbalance(ref_count, alt_count):
     """Test for allelic imbalance at a single site using binomial test.
 
     Tests the null hypothesis that both alleles are equally represented
@@ -266,8 +290,7 @@ def test_allelic_imbalance(ref_count, alt_count):
     if total == 0:
         return 1.0, np.nan
 
-    k = min(ref_count, alt_count)
-    result = scipy.stats.binomtest(k, total, 0.5)
+    result = scipy.stats.binomtest(alt_count, total, 0.5)
     pvalue = result.pvalue
     allelic_ratio = alt_count / total
     return pvalue, allelic_ratio
@@ -312,7 +335,7 @@ def aggregate_by_cluster(allele_counts, cluster_labels):
     for _, row in grouped.iterrows():
         rc = int(row['ref_count'])
         ac = int(row['alt_count'])
-        pval, ratio = test_allelic_imbalance(rc, ac)
+        pval, ratio = compute_allelic_imbalance(rc, ac)
         cluster_rows.append({
             'chrom': row['chrom'],
             'pos': int(row['pos']),
@@ -384,33 +407,7 @@ def aggregate_by_cluster(allele_counts, cluster_labels):
     return cluster_ase_df, diff_ase_df
 
 
-def _bh_correct(pvalues):
-    """Benjamini-Hochberg FDR correction."""
-    pvalues = np.asarray(pvalues, dtype=float)
-    n = len(pvalues)
-    if n == 0:
-        return pvalues
-
-    valid = ~np.isnan(pvalues)
-    adjusted = np.full_like(pvalues, np.nan)
-
-    if valid.sum() == 0:
-        return adjusted
-
-    valid_p = pvalues[valid]
-    sort_idx = np.argsort(valid_p)
-    sorted_p = valid_p[sort_idx]
-    ranks = np.arange(1, len(sorted_p) + 1)
-    adj_sorted = sorted_p * len(sorted_p) / ranks
-
-    # Enforce monotonicity
-    for i in range(len(adj_sorted) - 2, -1, -1):
-        adj_sorted[i] = min(adj_sorted[i], adj_sorted[i + 1])
-    adj_sorted = np.minimum(adj_sorted, 1.0)
-
-    unsort_idx = np.argsort(sort_idx)
-    adjusted[valid] = adj_sorted[unsort_idx]
-    return adjusted
+from ._stats import bh_correct as _bh_correct
 
 
 def main(args):

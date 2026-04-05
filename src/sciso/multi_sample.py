@@ -31,7 +31,7 @@ def argparser():
         help="Optional sample names corresponding to sample_dirs. "
              "If omitted, directory names are used.")
     parser.add_argument(
-        "--output_dir", type=Path, default="iris_comparison",
+        "--output_dir", type=Path, default="sciso_comparison",
         help="Directory for comparison output files.")
     parser.add_argument(
         "--fdr_threshold", type=float, default=0.05,

@@ -14,7 +14,9 @@ nextflow.enable.dsl = 2
 
 process cluster_analysis {
     cpus 2
-    memory "8 GB"
+    memory { 8.GB * task.attempt }
+    errorStrategy { task.exitStatus in [137, 140] ? 'retry' : 'terminate' }
+    maxRetries 2
     publishDir "${params.out_dir}/${params.sample_id}", mode: 'copy'
     input:
         path "gene_matrix"
@@ -33,7 +35,9 @@ process cluster_analysis {
 
 process dual_layer_clustering {
     cpus 4
-    memory "16 GB"
+    memory { 16.GB * task.attempt }
+    errorStrategy { task.exitStatus in [137, 140] ? 'retry' : 'terminate' }
+    maxRetries 2
     publishDir "${params.out_dir}/${params.sample_id}", mode: 'copy'
     input:
         path "gene_matrix"
@@ -57,7 +61,9 @@ process dual_layer_clustering {
 
 process cell_type_annotation {
     cpus 2
-    memory "8 GB"
+    memory { 8.GB * task.attempt }
+    errorStrategy { task.exitStatus in [137, 140] ? 'retry' : 'terminate' }
+    maxRetries 2
     publishDir "${params.out_dir}/${params.sample_id}", mode: 'copy'
     input:
         path "gene_matrix"
@@ -76,7 +82,9 @@ process cell_type_annotation {
 
 process differential_transcript_usage {
     cpus 4
-    memory "16 GB"
+    memory { 16.GB * task.attempt }
+    errorStrategy { task.exitStatus in [137, 140] ? 'retry' : 'terminate' }
+    maxRetries 2
     publishDir "${params.out_dir}/${params.sample_id}", mode: 'copy'
     input:
         path "transcript_matrix"
@@ -97,7 +105,9 @@ process differential_transcript_usage {
 
 process novel_isoform_discovery {
     cpus 2
-    memory "16 GB"
+    memory { 16.GB * task.attempt }
+    errorStrategy { task.exitStatus in [137, 140] ? 'retry' : 'terminate' }
+    maxRetries 2
     publishDir "${params.out_dir}/${params.sample_id}", mode: 'copy'
     input:
         path "transcript_matrix"
@@ -119,7 +129,9 @@ process novel_isoform_discovery {
 
 process isoform_trajectory {
     cpus 4
-    memory "16 GB"
+    memory { 16.GB * task.attempt }
+    errorStrategy { task.exitStatus in [137, 140] ? 'retry' : 'terminate' }
+    maxRetries 2
     publishDir "${params.out_dir}/${params.sample_id}", mode: 'copy'
     input:
         path "gene_matrix"
@@ -140,7 +152,9 @@ process isoform_trajectory {
 
 process allele_specific_expression {
     cpus 4
-    memory "32 GB"
+    memory { 32.GB * task.attempt }
+    errorStrategy { task.exitStatus in [137, 140] ? 'retry' : 'terminate' }
+    maxRetries 2
     publishDir "${params.out_dir}/${params.sample_id}", mode: 'copy'
     input:
         path "tagged.bam"
@@ -157,19 +171,21 @@ process allele_specific_expression {
 
 process export_anndata {
     cpus 1
-    memory "16 GB"
+    memory { 16.GB * task.attempt }
+    errorStrategy { task.exitStatus in [137, 140] ? 'retry' : 'terminate' }
+    maxRetries 2
     publishDir "${params.out_dir}/${params.sample_id}", mode: 'copy'
     input:
         path "gene_matrix"
         path "transcript_matrix"
         path inputs, stageAs: "inputs/*"
     output:
-        path "iris.h5ad", emit: h5ad
+        path "sciso.h5ad", emit: h5ad
     script:
     """
     sciso export gene_matrix \
         --transcript_matrix_dir transcript_matrix \
-        --output iris.h5ad \
+        --output sciso.h5ad \
         \$(ls inputs/joint_clusters.tsv 2>/dev/null && echo "--joint_clusters inputs/joint_clusters.tsv") \
         \$(ls inputs/joint.umap.tsv 2>/dev/null && echo "--joint_umap inputs/joint.umap.tsv") \
         \$(ls inputs/cell_type_annotations.tsv 2>/dev/null && echo "--cell_type_annotations inputs/cell_type_annotations.tsv") \
@@ -180,15 +196,17 @@ process export_anndata {
 
 process generate_report {
     cpus 1
-    memory "4 GB"
+    memory { 4.GB * task.attempt }
+    errorStrategy { task.exitStatus in [137, 140] ? 'retry' : 'terminate' }
+    maxRetries 2
     publishDir "${params.out_dir}/${params.sample_id}", mode: 'copy'
     input:
         path "results"
     output:
-        path "iris_report.html", emit: report
+        path "sciso_report.html", emit: report
     script:
     """
-    sciso report --out_dir results --output iris_report.html
+    sciso report --out_dir results --output sciso_report.html
     """
 }
 

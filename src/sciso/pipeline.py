@@ -4,7 +4,7 @@ Runs all sciso analysis modules in sequence on pre-processed
 single-cell long-read data. Supports:
   - Checkpointing: tracks completed steps, resumes from last failure
   - Error recovery: failing modules don't crash the pipeline
-  - File logging: all output goes to iris.log in the output directory
+  - File logging: all output goes to sciso.log in the output directory
   - Input validation: checks inputs before starting
 
 Inputs:
@@ -62,11 +62,11 @@ def argparser():
 
     # Output
     parser.add_argument(
-        "--out_dir", type=Path, default=Path("iris_results"),
+        "--out_dir", type=Path, default=Path("sciso_results"),
         help="Output directory.")
     parser.add_argument(
         "--log_file", type=str, default=None,
-        help="Log file path. Default: <out_dir>/iris.log")
+        help="Log file path. Default: <out_dir>/sciso.log")
 
     # Module toggles
     parser.add_argument(
@@ -116,7 +116,7 @@ class Checkpoint:
     """Track pipeline progress for resume capability."""
 
     def __init__(self, out_dir):
-        self.path = Path(out_dir) / ".iris_checkpoint.json"
+        self.path = Path(out_dir) / ".sciso_checkpoint.json"
         self.state = self._load()
 
     def _load(self):
@@ -205,11 +205,11 @@ def main(args):
     out.mkdir(parents=True, exist_ok=True)
 
     # Setup file logging
-    log_file = args.log_file or str(out / "iris.log")
+    log_file = args.log_file or str(out / "sciso.log")
     _setup_file_logging(log_file)
 
     logger.info("=" * 60)
-    logger.info("sciso pipeline starting")
+    logger.info("SCISO pipeline starting")
     logger.info("=" * 60)
     logger.info(f"  Gene matrix:       {args.gene_matrix_dir}")
     logger.info(f"  Transcript matrix: {args.transcript_matrix_dir}")
@@ -266,7 +266,11 @@ def main(args):
             a.n_marker_genes = 25
             a.marker_method = "wilcoxon"
             a.normalization = "scanpy"
+            a.norm_count = 10000
             a.cellranger_cell_calling = False
+            a.expected_cells = 3000
+            a.min_dist = 0.3
+            a.spread = 1.0
             run_fn(a)
 
         if _run_step(
@@ -302,6 +306,8 @@ def main(args):
             a.n_pcs = 50
             a.min_isoforms_per_gene = 2
             a.diversity_metric = "shannon"
+            a.isoform_weight = 3.0
+            a.normalize_pcs = True
             run_fn(a)
 
         if _run_step(
@@ -503,11 +509,11 @@ def main(args):
         a.cluster_comparison = out / "cluster_comparison.json"
         a.pseudotime = out / "pseudotime.tsv"
         a.ase_results = out / "ase_results.tsv"
-        a.output = out / "iris.h5ad"
+        a.output = out / "sciso.h5ad"
         run_fn(a)
 
     if _run_step('export', _run_export, checkpoint, logger, args.force):
-        results['h5ad'] = str(out / "iris.h5ad")
+        results['h5ad'] = str(out / "sciso.h5ad")
         n_success += 1
     else:
         n_failed += 1
@@ -523,11 +529,11 @@ def main(args):
         'skipped_steps': checkpoint.state.get('skipped', []),
         'outputs': results,
     }
-    with open(out / "iris_pipeline_summary.json", 'w') as fh:
+    with open(out / "sciso_pipeline_summary.json", 'w') as fh:
         json.dump(summary, fh, indent=2)
 
     logger.info("=" * 60)
-    logger.info("sciso pipeline finished")
+    logger.info("SCISO pipeline finished")
     logger.info(f"  Success: {n_success}  Failed: {n_failed}  "
                 f"Skipped: {n_skipped}")
     if n_failed > 0:
@@ -535,8 +541,8 @@ def main(args):
         logger.warning(f"  Failed steps: {', '.join(failed)}")
         logger.warning(f"  Fix issues and re-run with --resume")
     logger.info(f"  Results: {out}/")
-    if (out / "iris.h5ad").exists():
+    if (out / "sciso.h5ad").exists():
         logger.info(
-            f"  Load: adata = sc.read_h5ad('{out}/iris.h5ad')")
+            f"  Load: adata = sc.read_h5ad('{out}/sciso.h5ad')")
     logger.info(f"  Full log: {log_file}")
     logger.info("=" * 60)

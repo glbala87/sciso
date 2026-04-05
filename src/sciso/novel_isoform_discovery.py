@@ -386,40 +386,16 @@ def test_cluster_enrichment(
     return enrichment_df
 
 
-def _bh_correct(pvalues):
-    """Benjamini-Hochberg FDR correction."""
-    pvalues = np.asarray(pvalues, dtype=float)
-    n = len(pvalues)
-    if n == 0:
-        return pvalues
-
-    valid = ~np.isnan(pvalues)
-    adjusted = np.full_like(pvalues, np.nan)
-
-    if valid.sum() == 0:
-        return adjusted
-
-    valid_p = pvalues[valid]
-    sort_idx = np.argsort(valid_p)
-    sorted_p = valid_p[sort_idx]
-    ranks = np.arange(1, len(sorted_p) + 1)
-    adj_sorted = sorted_p * len(sorted_p) / ranks
-
-    # Enforce monotonicity
-    for i in range(len(adj_sorted) - 2, -1, -1):
-        adj_sorted[i] = min(adj_sorted[i], adj_sorted[i + 1])
-    adj_sorted = np.minimum(adj_sorted, 1.0)
-
-    unsort_idx = np.argsort(sort_idx)
-    adjusted[valid] = adj_sorted[unsort_idx]
-    return adjusted
+from ._stats import bh_correct as _bh_correct
 
 
 def compute_specificity_score(enrichment_df, fdr_threshold=0.05):
     """Compute a cluster specificity score for each novel isoform.
 
-    Isoforms expressed in only one cluster get higher scores.
-    Score = max(fold_enrichment) * (1 - entropy_of_cluster_distribution).
+    Uses a geometric combination of fold enrichment and cluster
+    specificity: score = fold_enrichment ^ (1 - normalized_entropy).
+    This preserves fold-change magnitude for moderately distributed
+    isoforms while still penalizing broadly expressed ones.
 
     :param enrichment_df: DataFrame from test_cluster_enrichment.
     :param fdr_threshold: FDR threshold for significant enrichment.
@@ -438,17 +414,27 @@ def compute_specificity_score(enrichment_df, fdr_threshold=0.05):
         # Distribution of expressing cells across clusters
         counts = grp['n_expressing_in_cluster'].values.astype(float)
         total = counts.sum()
+        n_clusters_tested = len(grp)
         if total > 0:
             props = counts / total
             props = props[props > 0]
+            n_expressing_clusters = len(props)
             entropy = -np.sum(props * np.log2(props))
-            max_entropy = np.log2(len(grp)) if len(grp) > 1 else 1.0
+            max_entropy = np.log2(n_clusters_tested) \
+                if n_clusters_tested > 1 else 1.0
             normalized_entropy = entropy / max_entropy \
                 if max_entropy > 0 else 0.0
         else:
             normalized_entropy = 1.0
+            n_expressing_clusters = 0
 
-        specificity = max_fold * (1.0 - normalized_entropy)
+        # Combined specificity score: fold-enrichment weighted by
+        # cluster selectivity. Uses log-fold to handle the range
+        # gracefully: score = log2(fold+1) * (1 - entropy)
+        # This gives 0 for uniformly distributed (entropy=1) and
+        # scales with fold enrichment for specific isoforms.
+        log_fold = np.log2(max_fold + 1.0)
+        specificity = log_fold * (1.0 - normalized_entropy)
 
         meta = grp.iloc[0]
         specificity_rows.append({

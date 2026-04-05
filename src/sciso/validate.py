@@ -183,7 +183,8 @@ def validate_tsv_file(path, required_columns=None, name="file"):
                 f"Found: {list(df.columns)}")
 
     # Count full rows
-    n_rows = sum(1 for _ in open(path)) - 1  # subtract header
+    with open(path) as fh:
+        n_rows = sum(1 for _ in fh) - 1  # subtract header
 
     return {
         'path': str(path),
@@ -256,6 +257,21 @@ def validate_bam_file(path, require_index=True,
     }
 
 
+def _load_barcodes_list(mex_dir):
+    """Load barcodes from a MEX directory as a list (preserving duplicates)."""
+    mex_dir = Path(mex_dir)
+    for fname in ['barcodes.tsv.gz', 'barcodes.tsv']:
+        p = mex_dir / fname
+        if p.exists():
+            if str(p).endswith('.gz'):
+                with gzip.open(p, 'rt') as fh:
+                    return [line.strip() for line in fh]
+            else:
+                with open(p) as fh:
+                    return [line.strip() for line in fh]
+    return []
+
+
 def validate_barcode_overlap(gene_dir, transcript_dir):
     """Check barcode overlap between gene and transcript matrices.
 
@@ -263,21 +279,20 @@ def validate_barcode_overlap(gene_dir, transcript_dir):
     """
     logger = get_named_logger("Validate")
 
-    def _load_barcodes(mex_dir):
-        mex_dir = Path(mex_dir)
-        for fname in ['barcodes.tsv.gz', 'barcodes.tsv']:
-            p = mex_dir / fname
-            if p.exists():
-                if str(p).endswith('.gz'):
-                    with gzip.open(p, 'rt') as fh:
-                        return set(line.strip() for line in fh)
-                else:
-                    with open(p) as fh:
-                        return set(line.strip() for line in fh)
-        return set()
+    gene_bc_list = _load_barcodes_list(gene_dir)
+    tx_bc_list = _load_barcodes_list(transcript_dir)
 
-    gene_bc = _load_barcodes(gene_dir)
-    tx_bc = _load_barcodes(transcript_dir)
+    # Check for duplicate barcodes
+    gene_bc = set(gene_bc_list)
+    tx_bc = set(tx_bc_list)
+    if len(gene_bc_list) != len(gene_bc):
+        n_dup = len(gene_bc_list) - len(gene_bc)
+        logger.warning(
+            f"  Gene matrix has {n_dup} duplicate barcodes.")
+    if len(tx_bc_list) != len(tx_bc):
+        n_dup = len(tx_bc_list) - len(tx_bc)
+        logger.warning(
+            f"  Transcript matrix has {n_dup} duplicate barcodes.")
     overlap = gene_bc & tx_bc
     pct = len(overlap) / max(len(gene_bc), 1) * 100
 
