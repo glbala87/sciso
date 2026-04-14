@@ -213,7 +213,7 @@ def main(args):
                 agg_cl0 = data[tx_idx][:, cl0_mask].sum(axis=1)
                 agg_rest = data[tx_idx][:, ~cl0_mask].sum(axis=1)
 
-                chi2, pval, effect = chi_squared_dtu_test(
+                chi2, pval, effect, _conv = chi_squared_dtu_test(
                     agg_cl0, agg_rest)
                 dtu_rows.append({
                     'gene': gene_id,

@@ -397,6 +397,9 @@ def main(args):
                 a.fdr_threshold = 0.05
                 a.cluster_column = "cluster"
                 a.n_jobs = args.n_jobs
+                a.comparison_mode = "one_vs_rest"
+                a.yates_correction = True
+                a.dm_maxiter = 200
                 run_fn(a)
 
             if _run_step(
